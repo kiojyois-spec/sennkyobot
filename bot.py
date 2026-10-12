@@ -1,17 +1,29 @@
 import os
 import discord
 from discord.ext import commands
+from discord import app_commands
 
-# --- メモリ上でのデータ保存用辞書 ---
-# 構造: { "選挙名": { voter_id: candidate_id } }
+# メモリ上でのデータ保存用 ({ "選挙名": { voter_id: candidate_id } })
 elections_data = {}
 
-# --- Discord Bot設定 ---
 intents = discord.Intents.default()
 intents.members = True          # メンバー情報取得用
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="/", intents=intents)
+class ElectionBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        # スラッシュコマンドをDiscordに同期する
+        await self.tree.sync()
+        print("Slash commands synced.")
+
+bot = ElectionBot()
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user.name}")
 
 # --- 投票用UIセレクトメニュー ---
 class VoteSelect(discord.ui.Select):
@@ -28,7 +40,6 @@ class VoteSelect(discord.ui.Select):
         candidate_id = int(self.values[0])
         candidate_member = interaction.guild.get_member(candidate_id)
 
-        # 選挙データの初期化（念のため）
         if self.election_name not in elections_data:
             elections_data[self.election_name] = {}
 
@@ -40,7 +51,7 @@ class VoteSelect(discord.ui.Select):
             )
             return
 
-        # メモリ上に投票データを記録
+        # メモリ上に記録
         elections_data[self.election_name][voter_id] = candidate_id
 
         await interaction.response.send_message(
@@ -53,43 +64,32 @@ class VoteView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(VoteSelect(election_name, candidates))
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user.name}")
-
 # --- 1. 立候補コマンド（一般ユーザー向け） ---
-@bot.command(name="apply")
-async def apply(ctx, role: discord.Role):
-    """
-    使用例: /apply @立候補者
-    実行したユーザーに指定したロールを付与します。
-    """
+@bot.tree.command(name="apply", description="指定した立候補ロールを自分に付与して立候補します")
+@app_commands.describe(role="付与する立候補者のロール")
+async def apply(interaction: discord.Interaction, role: discord.Role):
     try:
-        await ctx.author.add_roles(role)
-        await ctx.send(f"✅ {ctx.author.mention} さんに **{role.name}** ロールを付与し、立候補を受け付けました！", delete_after=10)
-        try:
-            await ctx.message.delete()
-        except:
-            pass
+        await interaction.user.add_roles(role)
+        await interaction.response.send_message(
+            f"✅ {interaction.user.mention} さんに **{role.name}** ロールを付与し、立候補を受け付けました！", 
+            ephemeral=True
+        )
     except discord.Forbidden:
-        await ctx.send("❌ Botにロールを付与する権限（ロールの管理）がありません。", delete_after=10)
+        await interaction.response.send_message("❌ Botにロールを付与する権限（ロールの管理）がありません。", ephemeral=True)
     except Exception as e:
-        await ctx.send(f"❌ エラーが発生しました: {e}", delete_after=10)
+        await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
 # --- 2. 選挙開始コマンド（管理者向け） ---
-@bot.command(name="election")
-@commands.has_permissions(administrator=True)
-async def election(ctx, election_name: str, role: discord.Role):
-    """
-    使用例: /election "第1回モデレーター選挙" @立候補者
-    """
+@bot.tree.command(name="election", description="モデレーター選挙を開始し、投票パネルを設置します")
+@app_commands.describe(election_name="選挙の名前", role="立候補者のロール")
+@app_commands.checks.has_permissions(administrator=True)
+async def election(interaction: discord.Interaction, election_name: str, role: discord.Role):
     candidates = [member for member in role.members]
     
     if not candidates:
-        await ctx.send("❌ 指定されたロールを持つ立候補者が見つかりませんでした。")
+        await interaction.response.send_message("❌ 指定されたロールを持つ立候補者が見つかりませんでした。", ephemeral=True)
         return
 
-    # 選挙データの初期領域を準備
     if election_name not in elections_data:
         elections_data[election_name] = {}
 
@@ -101,29 +101,27 @@ async def election(ctx, election_name: str, role: discord.Role):
     
     candidate_list = "\n".join([f"・ {c.mention}" for c in candidates])
     embed.add_field(name="立候補者一覧", value=candidate_list, inline=False)
-    embed.set_footer(text=f"主催: {ctx.author.display_name}")
+    embed.set_footer(text=f"主催: {interaction.user.display_name}")
 
     view = VoteView(election_name, candidates)
-    await ctx.send(embed=embed, view=view)
+    
+    await interaction.response.send_message(f"選挙「{election_name}」の投票パネルを作成しました！", ephemeral=True)
+    await interaction.channel.send(embed=embed, view=view)
 
 # --- 3. 開票・集計コマンド（管理者向け） ---
-@bot.command(name="results")
-@commands.has_permissions(administrator=True)
-async def results(ctx, election_name: str):
-    """
-    使用例: /results "第1回モデレーター選挙"
-    """
+@bot.tree.command(name="results", description="選挙の開票結果を集計して表示します")
+@app_commands.describe(election_name="集計する選挙の名前")
+@app_commands.checks.has_permissions(administrator=True)
+async def results(interaction: discord.Interaction, election_name: str):
     if election_name not in elections_data or not elections_data[election_name]:
-        await ctx.send(f"❌ 選挙「{election_name}」の投票データが存在しないか、まだ0票です。")
+        await interaction.response.send_message(f"❌ 選挙「{election_name}」の投票データが存在しないか、まだ0票です。", ephemeral=True)
         return
 
-    # メモリ上のデータから各候補者の得票数を集計
     votes = elections_data[election_name]
     candidate_counts = {}
     for candidate_id in votes.values():
         candidate_counts[candidate_id] = candidate_counts.get(candidate_id, 0) + 1
 
-    # 得票数順（降順）にソート
     sorted_results = sorted(candidate_counts.items(), key=lambda x: x[1], reverse=True)
 
     embed = discord.Embed(
@@ -133,11 +131,22 @@ async def results(ctx, election_name: str):
 
     result_text = ""
     for rank, (candidate_id, count) in enumerate(sorted_results, start=1):
-        member = ctx.guild.get_member(candidate_id)
+        member = interaction.guild.get_member(candidate_id)
         name = member.display_name if member else f"ID: {candidate_id}"
         result_text += f"**{rank}位**: {name} - **{count}票**\n"
 
     embed.add_field(name="集計結果", value=result_text, inline=False)
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
+
+# 権限エラーのハンドリング
+@results.error
+async def results_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ このコマンドを実行する権限がありません（管理者限定）。", ephemeral=True)
+
+@election.error
+async def election_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("❌ このコマンドを実行する権限がありません（管理者限定）。", ephemeral=True)
 
 bot.run(os.getenv("DISCORD_TOKEN"))
