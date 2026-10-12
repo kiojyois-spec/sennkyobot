@@ -1,33 +1,16 @@
 import os
-import sqlite3
 import discord
 from discord.ext import commands
 
-# --- データベース初期化 ---
-DB_NAME = "votes.db"
-
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS votes (
-            election_name TEXT,
-            voter_id INTEGER,
-            candidate_id INTEGER,
-            PRIMARY KEY (election_name, voter_id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
+# --- メモリ上でのデータ保存用辞書 ---
+# 構造: { "選挙名": { voter_id: candidate_id } }
+elections_data = {}
 
 # --- Discord Bot設定 ---
 intents = discord.Intents.default()
 intents.members = True          # メンバー情報取得用
 intents.message_content = True
 
-# コマンドプレフィックスを "/" に設定
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 # --- 投票用UIセレクトメニュー ---
@@ -45,27 +28,20 @@ class VoteSelect(discord.ui.Select):
         candidate_id = int(self.values[0])
         candidate_member = interaction.guild.get_member(candidate_id)
 
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
+        # 選挙データの初期化（念のため）
+        if self.election_name not in elections_data:
+            elections_data[self.election_name] = {}
 
-        # すでに投票済みかチェック
-        cursor.execute('SELECT candidate_id FROM votes WHERE election_name = ? AND voter_id = ?', 
-                       (self.election_name, voter_id))
-        row = cursor.fetchone()
-
-        if row:
-            conn.close()
+        # 1人1票制限のチェック
+        if voter_id in elections_data[self.election_name]:
             await interaction.response.send_message(
                 "⚠️ **すでに投票済みです！** 重複投票はできません。", 
                 ephemeral=True
             )
             return
 
-        # 投票の記録
-        cursor.execute('INSERT INTO votes (election_name, voter_id, candidate_id) VALUES (?, ?, ?)',
-                       (self.election_name, voter_id, candidate_id))
-        conn.commit()
-        conn.close()
+        # メモリ上に投票データを記録
+        elections_data[self.election_name][voter_id] = candidate_id
 
         await interaction.response.send_message(
             f"✅ **{candidate_member.display_name}** さんに投票を完了しました！", 
@@ -81,18 +57,18 @@ class VoteView(discord.ui.View):
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
 
-# --- 1. 立候補コマンド（ユーザー用） ---
+# --- 1. 立候補コマンド（一般ユーザー向け） ---
 @bot.command(name="apply")
 async def apply(ctx, role: discord.Role):
     """
     使用例: /apply @立候補者
-    実行したユーザーに指定したロールを自動付与して立候補します。
+    実行したユーザーに指定したロールを付与します。
     """
     try:
         await ctx.author.add_roles(role)
         await ctx.send(f"✅ {ctx.author.mention} さんに **{role.name}** ロールを付与し、立候補を受け付けました！", delete_after=10)
         try:
-            await ctx.message.delete() # チャンネルを綺麗にするためコマンドメッセージを削除
+            await ctx.message.delete()
         except:
             pass
     except discord.Forbidden:
@@ -100,7 +76,7 @@ async def apply(ctx, role: discord.Role):
     except Exception as e:
         await ctx.send(f"❌ エラーが発生しました: {e}", delete_after=10)
 
-# --- 2. 選挙開始コマンド（管理者用） ---
+# --- 2. 選挙開始コマンド（管理者向け） ---
 @bot.command(name="election")
 @commands.has_permissions(administrator=True)
 async def election(ctx, election_name: str, role: discord.Role):
@@ -112,6 +88,10 @@ async def election(ctx, election_name: str, role: discord.Role):
     if not candidates:
         await ctx.send("❌ 指定されたロールを持つ立候補者が見つかりませんでした。")
         return
+
+    # 選挙データの初期領域を準備
+    if election_name not in elections_data:
+        elections_data[election_name] = {}
 
     embed = discord.Embed(
         title=f"🗳️ モデレーター選挙: {election_name}",
@@ -126,30 +106,25 @@ async def election(ctx, election_name: str, role: discord.Role):
     view = VoteView(election_name, candidates)
     await ctx.send(embed=embed, view=view)
 
-# --- 3. 開票・集計コマンド（管理者用） ---
+# --- 3. 開票・集計コマンド（管理者向け） ---
 @bot.command(name="results")
 @commands.has_permissions(administrator=True)
 async def results(ctx, election_name: str):
     """
     使用例: /results "第1回モデレーター選挙"
     """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        SELECT candidate_id, COUNT(*) as vote_count 
-        FROM votes 
-        WHERE election_name = ? 
-        GROUP BY candidate_id 
-        ORDER BY vote_count DESC
-    ''', (election_name,))
-    
-    results_data = cursor.fetchall()
-    conn.close()
-
-    if not results_data:
+    if election_name not in elections_data or not elections_data[election_name]:
         await ctx.send(f"❌ 選挙「{election_name}」の投票データが存在しないか、まだ0票です。")
         return
+
+    # メモリ上のデータから各候補者の得票数を集計
+    votes = elections_data[election_name]
+    candidate_counts = {}
+    for candidate_id in votes.values():
+        candidate_counts[candidate_id] = candidate_counts.get(candidate_id, 0) + 1
+
+    # 得票数順（降順）にソート
+    sorted_results = sorted(candidate_counts.items(), key=lambda x: x[1], reverse=True)
 
     embed = discord.Embed(
         title=f"📊 開票結果: {election_name}",
@@ -157,7 +132,7 @@ async def results(ctx, election_name: str):
     )
 
     result_text = ""
-    for rank, (candidate_id, count) in enumerate(results_data, start=1):
+    for rank, (candidate_id, count) in enumerate(sorted_results, start=1):
         member = ctx.guild.get_member(candidate_id)
         name = member.display_name if member else f"ID: {candidate_id}"
         result_text += f"**{rank}位**: {name} - **{count}票**\n"
